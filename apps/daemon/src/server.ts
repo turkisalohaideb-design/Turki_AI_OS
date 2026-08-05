@@ -162,8 +162,13 @@ export async function runAgent(opts: RunAgentOptions): Promise<any> {
     }
   };
 
+  // accumulate full stdout as a fallback scanner for artifact blocks
+  let allStdout = '';
+
   // observe raw stdout for timers (parsers also attach handlers)
-  child.stdout?.on('data', () => {
+  child.stdout?.on('data', (chunk) => {
+    const s = chunk.toString();
+    allStdout += s;
     if (!sawFirstData) {
       sawFirstData = true;
       if (startupTimer) { clearTimeout(startupTimer); startupTimer = null; }
@@ -171,13 +176,20 @@ export async function runAgent(opts: RunAgentOptions): Promise<any> {
     armIdle();
   });
 
+  // Intercept file.write events so we don't duplicate them with fallback scanner
+  let emittedFileWrite = false;
+  const onEventWrapper = (ev: any) => {
+    if (ev && ev.type === 'file.write') emittedFileWrite = true;
+    opts.onEvent(ev);
+  };
+
   // write prompt if def prefers stdin
   if (def.promptViaStdin && child.stdin) {
     try {
       // enforce prompt budget if defined
       if (def.maxPromptArgBytes) checkPromptArgvBudget(Buffer.byteLength(opts.prompt, 'utf8'), def.maxPromptArgBytes);
     } catch (e: any) {
-      opts.onEvent({ type: 'error', error: e.message || String(e) });
+      onEventWrapper({ type: 'error', error: e.message || String(e) });
       child.kill();
       try { emitTelemetry('run.finished', { id: def.id, error: e.message || String(e) }); } catch (e) {}
       return child;
@@ -194,7 +206,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<any> {
   // forward stderr events
   child.stderr?.on('data', (chunk) => {
     const s = chunk.toString();
-    opts.onEvent({ type: 'stderr', text: s });
+    onEventWrapper({ type: 'stderr', text: s });
   });
 
   // Choose parser based on streamFormat or argv hint
@@ -211,25 +223,44 @@ export async function runAgent(opts: RunAgentOptions): Promise<any> {
   }
 
   if (fmt === 'json-event-stream') {
-    attachJsonEventParser(child, opts.onEvent).catch((err) => opts.onEvent({ type: 'error', error: String(err) })).finally(() => {
+    attachJsonEventParser(child, onEventWrapper).catch((err) => onEventWrapper({ type: 'error', error: String(err) })).finally(() => {
       try { emitTelemetry('run.finished', { id: def.id }); } catch (e) {}
     });
   } else if (fmt === 'plain') {
-    attachPlainStreamParser(child, opts.onEvent).catch((err) => opts.onEvent({ type: 'error', error: String(err) })).finally(() => {
+    attachPlainStreamParser(child, onEventWrapper).catch((err) => onEventWrapper({ type: 'error', error: String(err) })).finally(() => {
       try { emitTelemetry('run.finished', { id: def.id }); } catch (e) {}
     });
   } else {
     // fallback: stream raw stdout lines
     child.stdout?.on('data', (chunk) => {
       const s = chunk.toString();
-      opts.onEvent({ type: 'stdout', text: s });
+      onEventWrapper({ type: 'stdout', text: s });
     });
     child.stdout?.on('close', () => { try { emitTelemetry('run.finished', { id: def.id }); } catch (e) {} });
   }
 
   // when child exits, emit exit event and telemetry
   child.on('exit', (code, signal) => {
-    opts.onEvent({ type: 'exit', code, signal });
+    // fallback scan for artifact blocks if none were emitted by parser
+    if (!emittedFileWrite && allStdout) {
+      try {
+        const ARTIFACT_RE = /<artifact\s+identifier="([^"]+)"\s+type="([^"]+)"[^>]*>([\s\S]*?)<\/artifact>/gi;
+        let m;
+        while ((m = ARTIFACT_RE.exec(allStdout))) {
+          const identifier = m[1].toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+          const mime = m[2];
+          const content = m[3];
+          let filename;
+          if (mime === 'text/html' || mime === 'html') filename = `${identifier}.html`;
+          else if (mime === 'text/css' || mime === 'css') filename = `${identifier}.css`;
+          else if (mime === 'image/svg+xml' || mime === 'svg') filename = `${identifier}.svg`;
+          else if (mime === 'text/markdown' || mime === 'md' || mime === 'markdown') filename = `${identifier}.md`;
+          if (filename) onEventWrapper({ type: 'file.write', path: filename, content });
+        }
+      } catch (e) {}
+    }
+
+    onEventWrapper({ type: 'exit', code, signal });
     try { emitTelemetry('run.exit', { id: def.id, code, signal }); } catch (e) {}
   });
 
