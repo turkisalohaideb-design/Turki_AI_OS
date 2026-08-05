@@ -1,14 +1,28 @@
 #!/usr/bin/env node
 // Simple Turki CLI stub for integration tests
 // Usage: node turki-stub.js --mode=json|plain [--delay ms] [--malformed]
+// Supports: --list-models (prints TSV), --auth-status (prints OK or UNAUTH)
 
 const fs = require('fs');
 const path = require('path');
 
 const argv = require('minimist')(process.argv.slice(2));
-const mode = argv.mode || 'json';
+const mode = argv.mode || null;
 const delay = Number(argv.delay || 50);
 const malformed = Boolean(argv.malformed);
+
+// capability modes
+if (argv['list-models']) {
+  // print TSV: id\tlabel
+  console.log('turki-default\tTurki Default');
+  console.log('turki-pro\tTurki Pro');
+  process.exit(0);
+}
+if (argv['auth-status']) {
+  // print OK
+  console.log('OK');
+  process.exit(0);
+}
 
 let stdinData = '';
 process.stdin.setEncoding('utf8');
@@ -70,6 +84,12 @@ process.on('SIGTERM', async () => {
     const artifact = `<artifact identifier="landing-page" type="text/html" title="Landing page">\n<!doctype html><html><body>stub</body></html>\n</artifact>`;
     process.stdout.write(artifact + '\n');
     await sleep(delay);
+    process.exit(0);
+  }
+
+  // Default behavior: echo prompt then exit
+  if (!mode) {
+    process.stdout.write('NO_MODE_SPECIFIED\n');
     process.exit(0);
   }
 })();
