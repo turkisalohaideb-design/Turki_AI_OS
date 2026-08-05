@@ -1,4 +1,5 @@
 import React from 'react';
+import { Card, CardHeader, CardContent, CardTitle } from '@/components/ui/card';
 
 type Stat = {
   label: string;
@@ -8,9 +9,11 @@ type Stat = {
 
 export default function StatsCard({ stats }: { stats: Stat[] }) {
   return (
-    <div className="p-4 bg-zinc-900 rounded-2xl border border-zinc-800">
-      <h3 className="text-lg font-semibold text-white mb-3">System Status</h3>
-      <div className="space-y-3">
+    <Card>
+      <CardHeader className="px-4 py-3">
+        <CardTitle>System Status</CardTitle>
+      </CardHeader>
+      <CardContent className="p-4 space-y-3">
         {stats.map((s) => (
           <div key={s.label}>
             <div className="flex justify-between text-sm text-zinc-300 mb-1">
@@ -22,7 +25,7 @@ export default function StatsCard({ stats }: { stats: Stat[] }) {
             </div>
           </div>
         ))}
-      </div>
-    </div>
+      </CardContent>
+    </Card>
   );
 }
