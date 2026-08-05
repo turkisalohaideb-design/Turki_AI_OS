@@ -6,7 +6,7 @@ const { AGENT_DEFS } = require('../../../apps/daemon/src/runtimes/registry');
 jest.setTimeout(20000);
 
 describe('timeout guards', () => {
-  const fixture = path.join(__dirname, '..', 'fixtures', 'bin', 'turki-stub.js');
+  const fixture = path.join(__dirname, '..', '..', 'fixtures', 'bin', 'turki-stub.js');
   beforeAll(() => { if (!fs.existsSync(fixture)) throw new Error('Fixture missing'); });
 
   test('detectAgents respects version probe timeout', async () => {

@@ -4,6 +4,7 @@ import { AGENT_DEFS, getAgentDef } from './runtimes/registry';
 import { attachJsonEventParser } from './runtimes/json-event-stream';
 import { attachPlainStreamParser } from './runtimes/plain-stream';
 import { checkPromptArgvBudget } from './runtimes/prompt-budget';
+import { emitTelemetry } from './telemetry';
 
 export type AgentDetectionResult = {
   id: string;
@@ -57,17 +58,24 @@ export async function detectAgents(): Promise<AgentDetectionResult[]> {
           child.stdout?.on('data', (c) => out.push(Buffer.from(c)));
           await new Promise<void>((resolve) => child.once('exit', () => resolve()));
           const txt = Buffer.concat(out).toString().trim();
+          // Try JSON parse
           try {
             const parsed = JSON.parse(txt);
             r.models = Array.isArray(parsed) ? parsed : (parsed.models || []);
           } catch (e) {
-            // try newline-delimited JSON
+            // Try newline-delimited JSON
             const lines = txt.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-            const parsed: any[] = [];
+            const parsedObjs: any[] = [];
             for (const L of lines) {
-              try { parsed.push(JSON.parse(L)); } catch (_) {}
+              if (L.includes('\t')) {
+                // TSV id\tlabel
+                const [id, label] = L.split('\t');
+                parsedObjs.push({ id, label });
+              } else {
+                try { parsedObjs.push(JSON.parse(L)); } catch (_) {}
+              }
             }
-            r.models = parsed;
+            r.models = parsedObjs;
           }
         } catch (e) {
           // ignore capability discovery failures
@@ -117,6 +125,9 @@ export async function runAgent(opts: RunAgentOptions): Promise<any> {
   const spawnOptions: any = { stdio: ['pipe', 'pipe', 'pipe'] };
   const child = spawn(def.bin, argv, spawnOptions);
 
+  // telemetry: started
+  try { emitTelemetry('run.started', { id: def.id, argv }); } catch (e) {}
+
   // write prompt if def prefers stdin
   if (def.promptViaStdin && child.stdin) {
     try {
@@ -125,6 +136,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<any> {
     } catch (e: any) {
       opts.onEvent({ type: 'error', error: e.message || String(e) });
       child.kill();
+      try { emitTelemetry('run.finished', { id: def.id, error: e.message || String(e) }); } catch (e) {}
       return child;
     }
 
@@ -142,23 +154,32 @@ export async function runAgent(opts: RunAgentOptions): Promise<any> {
     opts.onEvent({ type: 'stderr', text: s });
   });
 
-  // Choose parser based on streamFormat
-  const fmt = def.streamFormat || 'plain';
+  // Choose parser based on streamFormat or argv hint
+  let fmt = def.streamFormat || 'plain';
+  const lowerArgs = argv.join(' ');
+  if (/--mode=plain|--mode plain/.test(lowerArgs)) fmt = 'plain';
+
   if (fmt === 'json-event-stream') {
-    attachJsonEventParser(child, opts.onEvent).catch((err) => opts.onEvent({ type: 'error', error: String(err) }));
+    attachJsonEventParser(child, opts.onEvent).catch((err) => opts.onEvent({ type: 'error', error: String(err) })).finally(() => {
+      try { emitTelemetry('run.finished', { id: def.id }); } catch (e) {}
+    });
   } else if (fmt === 'plain') {
-    attachPlainStreamParser(child, opts.onEvent).catch((err) => opts.onEvent({ type: 'error', error: String(err) }));
+    attachPlainStreamParser(child, opts.onEvent).catch((err) => opts.onEvent({ type: 'error', error: String(err) })).finally(() => {
+      try { emitTelemetry('run.finished', { id: def.id }); } catch (e) {}
+    });
   } else {
     // fallback: stream raw stdout lines
     child.stdout?.on('data', (chunk) => {
       const s = chunk.toString();
       opts.onEvent({ type: 'stdout', text: s });
     });
+    child.stdout?.on('close', () => { try { emitTelemetry('run.finished', { id: def.id }); } catch (e) {} });
   }
 
-  // when child exits, emit exit event
+  // when child exits, emit exit event and telemetry
   child.on('exit', (code, signal) => {
     opts.onEvent({ type: 'exit', code, signal });
+    try { emitTelemetry('run.exit', { id: def.id, code, signal }); } catch (e) {}
   });
 
   return child;
