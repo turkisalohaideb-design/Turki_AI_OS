@@ -28,8 +28,13 @@ export async function detectAgents(): Promise<AgentDetectionResult[]> {
       try {
         const child = spawn(def.bin, def.versionArgs, { stdio: 'ignore' });
         const exitPromise = new Promise<void>((resolve) => child.once('exit', () => resolve()));
-        const timeoutPromise = new Promise<void>((resolve) => setTimeout(resolve, timeoutMs));
+        let timeoutId: NodeJS.Timeout | null = null;
+        const timeoutPromise = new Promise<void>((resolve) => {
+          timeoutId = setTimeout(resolve, timeoutMs);
+        });
         const first = await Promise.race([exitPromise.then(() => 'exit'), timeoutPromise.then(() => 'timeout')]);
+        // clear stray timer if any
+        if (timeoutId) clearTimeout(timeoutId);
         if (first === 'exit') {
           r.available = true;
         } else {
