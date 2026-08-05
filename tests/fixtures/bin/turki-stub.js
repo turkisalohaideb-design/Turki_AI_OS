@@ -6,7 +6,28 @@
 const fs = require('fs');
 const path = require('path');
 
-const argv = require('minimist')(process.argv.slice(2));
+const args = process.argv.slice(2);
+function parseArgs(arr) {
+  const out = {};
+  for (let i = 0; i < arr.length; i++) {
+    const a = arr[i];
+    if (a.startsWith('--')) {
+      const k = a.slice(2);
+      if (k.includes('=')) {
+        const [key, val] = k.split('=');
+        out[key] = val;
+      } else {
+        // lookahead value
+        const next = arr[i+1];
+        if (!next || next.startsWith('--')) out[k] = true;
+        else { out[k] = next; i++; }
+      }
+    }
+  }
+  return out;
+}
+
+const argv = parseArgs(args);
 const mode = argv.mode || null;
 const delay = Number(argv.delay || 50);
 const malformed = Boolean(argv.malformed);
