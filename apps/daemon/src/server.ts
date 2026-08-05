@@ -2,6 +2,7 @@ import { spawn, SpawnOptions, ChildProcess } from 'child_process';
 import * as stream from 'stream';
 import { AGENT_DEFS, getAgentDef } from './runtimes/registry';
 import { checkPromptArgvBudget, checkWindowsCmdShimCommandLineBudget, checkWindowsDirectExeCommandLineBudget } from './runtimes/prompt-budget';
+import { getTimeouts } from './runtimes/config';
 
 // Parsers
 import * as jsonEventParser from './runtimes/json-event-stream';
@@ -20,27 +21,46 @@ export type AgentDetectionResult = {
   diagnostics?: string[];
 };
 
+function withTimeout<T>(p: Promise<T>, ms: number, onTimeout?: () => void): Promise<T> {
+  if (!ms || ms <= 0) return p;
+  let timer: NodeJS.Timeout | null = null;
+  return Promise.race([
+    p.finally(() => { if (timer) clearTimeout(timer); }),
+    new Promise<T>((_, rej) => {
+      timer = setTimeout(() => {
+        if (onTimeout) onTimeout();
+        rej(new Error('operation timed out'));
+      }, ms);
+    }),
+  ]);
+}
+
 // Detect agents by running their version probe. This is a best-effort, per-def fault-isolated probe.
 export async function detectAgents(): Promise<AgentDetectionResult[]> {
   const results: AgentDetectionResult[] = [];
+  const timeouts = getTimeouts();
 
   await Promise.all(
     AGENT_DEFS.map(async (def) => {
       const res: AgentDetectionResult = { id: def.id, available: false };
       try {
-        // spawn sync version probe to get quick availability
+        // spawn version probe
         const child = spawn(def.bin, def.versionArgs || ['--version'], { stdio: ['ignore', 'pipe', 'pipe'] });
         let stdout = '';
         if (child.stdout) {
           child.stdout.on('data', (b) => (stdout += b.toString()));
         }
-        await new Promise((resolve) => child.once('close', resolve));
+
+        // wait for close with timeout
+        await withTimeout(new Promise((resolve) => child.once('close', resolve)), timeouts.versionProbeTimeoutMs, () => {
+          try { child.kill(); } catch {};
+        });
+
         if (stdout.trim()) {
           res.available = true;
           res.version = stdout.trim().split('\n')[0];
           res.path = def.bin;
         } else {
-          // binary ran but produced no version output — still available
           res.available = true;
           res.path = def.bin;
         }
@@ -69,6 +89,7 @@ export type RunOptions = {
 export async function runAgent(opts: RunOptions): Promise<ChildProcess> {
   const def = getAgentDef(opts.agentId);
   if (!def) throw new Error(`Unknown agent id: ${opts.agentId}`);
+  const timeouts = getTimeouts();
 
   // Validate prompt budget when the def does not accept stdin
   const promptBytes = Buffer.byteLength(opts.prompt || '', 'utf8');
@@ -76,8 +97,6 @@ export async function runAgent(opts: RunOptions): Promise<ChildProcess> {
     // Fast pre-resolution check
     checkPromptArgvBudget(promptBytes, def.maxPromptArgBytes);
 
-    // For Windows specific guards we'd need to know the resolved binary path and shim/direct detail.
-    // Here we conservatively build a command line and check both guards to be safe.
     const simulatedCmd = `${def.bin} ${def.buildArgs(opts.prompt || '', opts.imagePaths || [], opts.extraAllowedDirs || [], opts.options || {}, opts.runtimeContext || {})
       .map((a) => (a.includes(' ') ? `"${a}"` : a))
       .join(' ')}`;
@@ -96,11 +115,51 @@ export async function runAgent(opts: RunOptions): Promise<ChildProcess> {
 
   const child = spawn(def.bin, argv, spawnOptions);
 
+  // Setup parser idle timeout and process execution timeout
+  let execTimer: NodeJS.Timeout | null = null;
+  if (timeouts.processExecutionTimeoutMs && timeouts.processExecutionTimeoutMs > 0) {
+    execTimer = setTimeout(() => {
+      try { child.kill(); } catch {}
+      const onEvent = opts.onEvent || (() => undefined);
+      onEvent({ type: 'timeout', message: 'process execution timed out' });
+    }, timeouts.processExecutionTimeoutMs);
+  }
+
+  // Startup timeout: ensure the process produces some output within startup timeout
+  let startupTimer: NodeJS.Timeout | null = null;
+  let sawOutput = false;
+  const onAnyOutput = () => {
+    sawOutput = true;
+    if (startupTimer) { clearTimeout(startupTimer); startupTimer = null; }
+  };
+
+  if (timeouts.processStartupTimeoutMs && timeouts.processStartupTimeoutMs > 0) {
+    startupTimer = setTimeout(() => {
+      if (!sawOutput) {
+        try { child.kill(); } catch {}
+        const onEvent = opts.onEvent || (() => undefined);
+        onEvent({ type: 'error', message: 'process startup timeout' });
+      }
+    }, timeouts.processStartupTimeoutMs);
+  }
+
+  // Idle parser timeout: if no stdout/stderr data for parserIdleTimeoutMs, kill
+  let idleTimer: NodeJS.Timeout | null = null;
+  const resetIdle = () => {
+    if (idleTimer) clearTimeout(idleTimer);
+    if (!timeouts.parserIdleTimeoutMs || timeouts.parserIdleTimeoutMs <= 0) return;
+    idleTimer = setTimeout(() => {
+      try { child.kill(); } catch {}
+      const onEvent = opts.onEvent || (() => undefined);
+      onEvent({ type: 'error', message: 'parser idle timeout' });
+    }, timeouts.parserIdleTimeoutMs);
+  };
+  resetIdle();
+
   // If promptViaStdin, write the composed prompt to stdin
   if (def.promptViaStdin) {
     if (child.stdin) {
       child.stdin.write(opts.prompt || '');
-      // For 'stream-json' keep stdin open — the def indicates whether it's stream-json and the engine will close when run ends
       if (def.promptInputFormat !== 'stream-json') child.stdin.end();
     }
   }
@@ -109,9 +168,20 @@ export async function runAgent(opts: RunOptions): Promise<ChildProcess> {
   const parser = PARSER_MAP[def.streamFormat];
   const onEvent = opts.onEvent || (() => undefined);
 
+  if (child.stdout) {
+    child.stdout.on('data', (b) => { onAnyOutput(); resetIdle(); });
+  }
+  if (child.stderr) {
+    child.stderr.on('data', (b) => { onAnyOutput(); resetIdle(); });
+  }
+
   if (parser) {
     parser(child, onEvent).catch((err) => {
       onEvent({ type: 'error', error: err?.message || String(err) });
+    }).finally(() => {
+      if (execTimer) clearTimeout(execTimer);
+      if (startupTimer) clearTimeout(startupTimer);
+      if (idleTimer) clearTimeout(idleTimer);
     });
   } else {
     // Fallback: forward raw stdout as text-delta events
@@ -120,9 +190,13 @@ export async function runAgent(opts: RunOptions): Promise<ChildProcess> {
       child.stdout.on('data', (b) => {
         buf += b.toString();
         onEvent({ type: 'assistant.delta', text: b.toString() });
+        resetIdle();
       });
       child.stdout.on('end', () => {
         onEvent({ type: 'done', text: buf });
+        if (execTimer) clearTimeout(execTimer);
+        if (startupTimer) clearTimeout(startupTimer);
+        if (idleTimer) clearTimeout(idleTimer);
       });
     }
   }
