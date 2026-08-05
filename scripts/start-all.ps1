@@ -12,7 +12,13 @@ if ($DaemonCmd) {
   Write-Host "Launching daemon with command: $DaemonCmd" -ForegroundColor Green
   Start-Process -NoNewWindow -FilePath pwsh -ArgumentList "-NoProfile -NoLogo -Command `"$DaemonCmd`""
 } else {
-  Write-Host "No DAEMON_CMD provided. If you need the backend daemon, set DAEMON_CMD env var or run it manually." -ForegroundColor Yellow
+  Write-Host "No DAEMON_CMD provided. Launching embedded stub daemon on port 8080." -ForegroundColor Yellow
+  $stub = Join-Path $PWD 'scripts\stub-daemon.js'
+  if (Test-Path $stub) {
+    Start-Process -NoNewWindow -FilePath pwsh -ArgumentList "-NoProfile -NoLogo -Command `"node '$stub'`""
+  } else {
+    Write-Host "Stub daemon not found at $stub. Run the daemon manually or set DAEMON_CMD." -ForegroundColor Red
+  }
 }
 
 Write-Host "Started processes. Check opened terminals for logs." -ForegroundColor Cyan
