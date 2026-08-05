@@ -31,14 +31,16 @@ export async function detectAgents(): Promise<AgentDetectionResult[]> {
         const timeoutMs = Number(process.env.DAEMON_VERSION_PROBE_TIMEOUT_MS || 2000);
         try {
           const child = spawn(def.bin, def.versionArgs, { stdio: 'ignore' });
-          let timedOut = false;
-          const t = setTimeout(() => {
-            timedOut = true;
+          const exitPromise = new Promise<void>((resolve) => child.once('exit', () => resolve()));
+          const timeoutPromise = new Promise<void>((resolve) => setTimeout(resolve, timeoutMs));
+          const first = await Promise.race([exitPromise.then(() => 'exit'), timeoutPromise.then(() => 'timeout')]);
+          if (first === 'exit') {
+            r.available = true;
+          } else {
             try { child.kill(); } catch (e) {}
-          }, timeoutMs);
-          await new Promise<void>((resolve) => child.once('exit', () => resolve()));
-          clearTimeout(t);
-          if (!timedOut) r.available = true; else { r.available = false; r.diagnostics!.push('version probe timeout'); }
+            r.available = false;
+            r.diagnostics!.push('version probe timeout');
+          }
         } catch (err: any) {
           r.available = false;
           r.diagnostics!.push(String(err));
@@ -197,8 +199,16 @@ export async function runAgent(opts: RunAgentOptions): Promise<any> {
 
   // Choose parser based on streamFormat or argv hint
   let fmt = def.streamFormat || 'plain';
-  const lowerArgs = argv.join(' ');
-  if (/--mode=plain|--mode plain/.test(lowerArgs)) fmt = 'plain';
+  // explicit arg scan for --mode=plain to override declared streamFormat (used by tests)
+  if (argv.some((a) => a === '--mode=plain' || a === '--mode' )) {
+    // if present and inline --mode=plain or --mode plain, normalize to plain
+    for (let i = 0; i < argv.length; i++) {
+      const a = argv[i];
+      if (a === '--mode=plain') { fmt = 'plain'; break; }
+      if (a === '--mode' && argv[i+1] && String(argv[i+1]).toLowerCase() === 'plain') { fmt = 'plain'; break; }
+      if (String(a).toLowerCase().startsWith('--mode=') && String(a).toLowerCase().includes('plain')) { fmt = 'plain'; break; }
+    }
+  }
 
   if (fmt === 'json-event-stream') {
     attachJsonEventParser(child, opts.onEvent).catch((err) => opts.onEvent({ type: 'error', error: String(err) })).finally(() => {
