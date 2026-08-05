@@ -22,7 +22,10 @@ export const turkiAgentDef: RuntimeAgentDef = {
   supportsImagePaths: true,
 
   // Auth probe to check whether CLI is logged in / configured
-  authProbe: { args: ['auth', 'status'], timeoutMs: 5000 },
+  authProbe: { args: ['--auth-status'], timeoutMs: 5000 },
+
+  // Model discovery command
+  listModels: { listCommandArgs: ['--list-models'] },
 
   // Reuse an existing structured parser in the daemon: json-event-stream
   streamFormat: 'json-event-stream',

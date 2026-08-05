@@ -1,212 +1,86 @@
-import { spawn, SpawnOptions, ChildProcess } from 'child_process';
-import * as stream from 'stream';
-import { AGENT_DEFS, getAgentDef } from './runtimes/registry';
-import { checkPromptArgvBudget, checkWindowsCmdShimCommandLineBudget, checkWindowsDirectExeCommandLineBudget } from './runtimes/prompt-budget';
-import { getTimeouts } from './runtimes/config';
-
-// Parsers
-import * as jsonEventParser from './runtimes/json-event-stream';
-import * as plainStreamParser from './runtimes/plain-stream';
-
-const PARSER_MAP: Record<string, (proc: ChildProcess, onEvent: (ev: any) => void) => Promise<void>> = {
-  'json-event-stream': jsonEventParser.attachJsonEventParser,
-  'plain': plainStreamParser.attachPlainStreamParser,
-};
-
-export type AgentDetectionResult = {
-  id: string;
-  available: boolean;
-  path?: string;
-  version?: string;
-  diagnostics?: string[];
-};
-
-function withTimeout<T>(p: Promise<T>, ms: number, onTimeout?: () => void): Promise<T> {
-  if (!ms || ms <= 0) return p;
-  let timer: NodeJS.Timeout | null = null;
-  return Promise.race([
-    p.finally(() => { if (timer) clearTimeout(timer); }),
-    new Promise<T>((_, rej) => {
-      timer = setTimeout(() => {
-        if (onTimeout) onTimeout();
-        rej(new Error('operation timed out'));
-      }, ms);
-    }),
-  ]);
-}
-
-// Detect agents by running their version probe. This is a best-effort, per-def fault-isolated probe.
-export async function detectAgents(): Promise<AgentDetectionResult[]> {
-  const results: AgentDetectionResult[] = [];
-  const timeouts = getTimeouts();
-
-  await Promise.all(
-    AGENT_DEFS.map(async (def) => {
-      const res: AgentDetectionResult = { id: def.id, available: false };
-      try {
-        // spawn version probe
-        const child = spawn(def.bin, def.versionArgs || ['--version'], { stdio: ['ignore', 'pipe', 'pipe'] });
-        let stdout = '';
-        if (child.stdout) {
-          child.stdout.on('data', (b) => (stdout += b.toString()));
-        }
-
-        // wait for close with timeout
-        await withTimeout(new Promise((resolve) => child.once('close', resolve)), timeouts.versionProbeTimeoutMs, () => {
-          try { child.kill(); } catch {};
-        });
-
-        if (stdout.trim()) {
-          res.available = true;
-          res.version = stdout.trim().split('\n')[0];
-          res.path = def.bin;
-        } else {
-          res.available = true;
-          res.path = def.bin;
-        }
-      } catch (err: any) {
-        res.available = false;
-        res.diagnostics = [err?.message || String(err)];
-      }
-      results.push(res);
-    }),
-  );
-
-  return results;
-}
-
-export type RunOptions = {
-  agentId: string;
-  prompt: string;
-  imagePaths?: string[];
-  extraAllowedDirs?: string[];
-  options?: any;
-  runtimeContext?: any;
-  onEvent?: (ev: any) => void;
-};
-
-// Runs an agent defined by agentId. Returns the child process. Events will be emitted via onEvent.
-export async function runAgent(opts: RunOptions): Promise<ChildProcess> {
-  const def = getAgentDef(opts.agentId);
-  if (!def) throw new Error(`Unknown agent id: ${opts.agentId}`);
-  const timeouts = getTimeouts();
-
-  // Validate prompt budget when the def does not accept stdin
-  const promptBytes = Buffer.byteLength(opts.prompt || '', 'utf8');
-  if (!def.promptViaStdin) {
-    // Fast pre-resolution check
-    checkPromptArgvBudget(promptBytes, def.maxPromptArgBytes);
-
-    const simulatedCmd = `${def.bin} ${def.buildArgs(opts.prompt || '', opts.imagePaths || [], opts.extraAllowedDirs || [], opts.options || {}, opts.runtimeContext || {})
-      .map((a) => (a.includes(' ') ? `"${a}"` : a))
-      .join(' ')}`;
-
-    try {
-      checkWindowsCmdShimCommandLineBudget(simulatedCmd);
-    } catch (e) {
-      // try direct-exe guard too; if either throws, bubble the error
-      checkWindowsDirectExeCommandLineBudget(simulatedCmd);
-    }
-  }
-
-  const argv = def.buildArgs(opts.prompt || '', opts.imagePaths || [], opts.extraAllowedDirs || [], opts.options || {}, opts.runtimeContext || {});
-
-  const spawnOptions: SpawnOptions = { cwd: opts.runtimeContext?.cwd || process.cwd(), stdio: ['pipe', 'pipe', 'pipe'] };
-
-  const child = spawn(def.bin, argv, spawnOptions);
-
-  // Setup parser idle timeout and process execution timeout
-  let execTimer: NodeJS.Timeout | null = null;
-  if (timeouts.processExecutionTimeoutMs && timeouts.processExecutionTimeoutMs > 0) {
-    execTimer = setTimeout(() => {
-      try { child.kill(); } catch {}
-      const onEvent = opts.onEvent || (() => undefined);
-      onEvent({ type: 'timeout', message: 'process execution timed out' });
-    }, timeouts.processExecutionTimeoutMs);
-  }
-
-  // Startup timeout: ensure the process produces some output within startup timeout
-  let startupTimer: NodeJS.Timeout | null = null;
-  let sawOutput = false;
-  const onAnyOutput = () => {
-    sawOutput = true;
-    if (startupTimer) { clearTimeout(startupTimer); startupTimer = null; }
-  };
-
-  if (timeouts.processStartupTimeoutMs && timeouts.processStartupTimeoutMs > 0) {
-    startupTimer = setTimeout(() => {
-      if (!sawOutput) {
-        try { child.kill(); } catch {}
-        const onEvent = opts.onEvent || (() => undefined);
-        onEvent({ type: 'error', message: 'process startup timeout' });
-      }
-    }, timeouts.processStartupTimeoutMs);
-  }
-
-  // Idle parser timeout: if no stdout/stderr data for parserIdleTimeoutMs, kill
-  let idleTimer: NodeJS.Timeout | null = null;
-  const resetIdle = () => {
-    if (idleTimer) clearTimeout(idleTimer);
-    if (!timeouts.parserIdleTimeoutMs || timeouts.parserIdleTimeoutMs <= 0) return;
-    idleTimer = setTimeout(() => {
-      try { child.kill(); } catch {}
-      const onEvent = opts.onEvent || (() => undefined);
-      onEvent({ type: 'error', message: 'parser idle timeout' });
-    }, timeouts.parserIdleTimeoutMs);
-  };
-  resetIdle();
-
-  // If promptViaStdin, write the composed prompt to stdin
-  if (def.promptViaStdin) {
-    if (child.stdin) {
-      child.stdin.write(opts.prompt || '');
-      if (def.promptInputFormat !== 'stream-json') child.stdin.end();
-    }
-  }
-
-  // Route stdout/stderr through the parser selected by streamFormat
-  const parser = PARSER_MAP[def.streamFormat];
-  const onEvent = opts.onEvent || (() => undefined);
-
-  if (child.stdout) {
-    child.stdout.on('data', (b) => { onAnyOutput(); resetIdle(); });
-  }
-  if (child.stderr) {
-    child.stderr.on('data', (b) => { onAnyOutput(); resetIdle(); });
-  }
-
-  if (parser) {
-    parser(child, onEvent).catch((err) => {
-      onEvent({ type: 'error', error: err?.message || String(err) });
-    }).finally(() => {
-      if (execTimer) clearTimeout(execTimer);
-      if (startupTimer) clearTimeout(startupTimer);
-      if (idleTimer) clearTimeout(idleTimer);
-    });
-  } else {
-    // Fallback: forward raw stdout as text-delta events
-    let buf = '';
-    if (child.stdout) {
-      child.stdout.on('data', (b) => {
-        buf += b.toString();
-        onEvent({ type: 'assistant.delta', text: b.toString() });
-        resetIdle();
-      });
-      child.stdout.on('end', () => {
-        onEvent({ type: 'done', text: buf });
-        if (execTimer) clearTimeout(execTimer);
-        if (startupTimer) clearTimeout(startupTimer);
-        if (idleTimer) clearTimeout(idleTimer);
-      });
-    }
-  }
-
-  if (child.stderr) {
-    child.stderr.on('data', (b) => onEvent({ type: 'stderr', text: b.toString() }));
-  }
-
-  child.on('error', (err) => onEvent({ type: 'error', error: err?.message || String(err) }));
-  child.on('exit', (code, signal) => onEvent({ type: 'exit', code, signal }));
-
-  return child;
-}
+*** Begin Patch
+*** Update File: apps/daemon/src/server.ts
+@@
+ export type AgentDetectionResult = {
+   id: string;
+   available: boolean;
+   path?: string;
+   version?: string;
+-  diagnostics?: string[];
++  diagnostics?: string[];
++  models?: { id: string; label?: string }[];
++  auth?: 'ok' | 'unauth' | 'unknown';
+ };
+@@
+   await Promise.all(
+     AGENT_DEFS.map(async (def) => {
+       const res: AgentDetectionResult = { id: def.id, available: false };
+       try {
+@@
+-        if (stdout.trim()) {
+-          res.available = true;
+-          res.version = stdout.trim().split('\n')[0];
+-          res.path = def.bin;
+-        } else {
+-          res.available = true;
+-          res.path = def.bin;
+-        }
++        if (stdout.trim()) {
++          res.available = true;
++          res.version = stdout.trim().split('\n')[0];
++          res.path = def.bin;
++        } else {
++          res.available = true;
++          res.path = def.bin;
++        }
++
++        // Concurrently run authProbe and listModels when declared
++        // authProbe: set res.auth = 'ok' | 'unauth' | 'unknown'
++        const probes: Promise<void>[] = [];
++        if (def.authProbe) {
++          const probeArgs = def.authProbe.args || [];
++          probes.push(
++            (async () => {
++              try {
++                const c = spawn(def.bin, probeArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
++                let out = '';
++                if (c.stdout) c.stdout.on('data', (b) => (out += b.toString()));
++                await withTimeout(new Promise((r) => c.once('close', r)), def.authProbe.timeoutMs || timeouts.versionProbeTimeoutMs, () => { try { c.kill(); } catch {} });
++                const txt = (out || '').toLowerCase();
++                if (txt.includes('ok') || txt.includes('authenticated') || txt.includes('true')) res.auth = 'ok';
++                else if (txt.includes('unauth') || txt.includes('not') || txt.includes('false')) res.auth = 'unauth';
++                else res.auth = 'unknown';
++              } catch (e) {
++                res.auth = 'unknown';
++              }
++            })(),
++          );
++        }
++
++        if ((def as any).listModels && (def as any).listModels.listCommandArgs) {
++          const args = (def as any).listModels.listCommandArgs as string[];
++          probes.push(
++            (async () => {
++              try {
++                const c = spawn(def.bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
++                let out = '';
++                if (c.stdout) c.stdout.on('data', (b) => (out += b.toString()));
++                await withTimeout(new Promise((r) => c.once('close', r)), timeouts.versionProbeTimeoutMs, () => { try { c.kill(); } catch {} });
++                const lines = (out || '').split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
++                const models: { id: string; label?: string }[] = [];
++                for (const l of lines) {
++                  const parts = l.split('\t');
++                  if (parts.length >= 2) models.push({ id: parts[0], label: parts[1] });
++                  else models.push({ id: l, label: l });
++                }
++                res.models = models;
++              } catch (e) {
++                // ignore model discovery failures; leave models undefined
++              }
++            })(),
++          );
++        }
++
++        // await probes but do not fail detection on probe errors
++        if (probes.length) await Promise.all(probes.map((p) => p.catch(() => undefined)));
+*** End Patch
