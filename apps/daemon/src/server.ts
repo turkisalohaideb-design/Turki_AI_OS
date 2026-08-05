@@ -1,52 +1,33 @@
 *** Begin Patch
 *** Update File: apps/daemon/src/server.ts
 @@
--import { AGENT_DEFS, getAgentDef } from './runtimes/registry';
-+import { AGENT_DEFS, getAgentDef } from './runtimes/registry';
-+import { logger } from './logging';
-+import { emitTelemetry } from './telemetry';
+-import { checkPromptArgvBudget, checkWindowsCmdShimCommandLineBudget, checkWindowsDirectExeCommandLineBudget } from './runtimes/prompt-budget';
++import { checkPromptArgvBudget, checkWindowsCmdShimCommandLineBudget, checkWindowsDirectExeCommandLineBudget } from './runtimes/prompt-budget';
++import { trackChild, untrackChild } from './server.childs';
 @@
- export async function detectAgents(): Promise<AgentDetectionResult[]> {
-   const results: AgentDetectionResult[] = [];
-   const timeouts = getTimeouts();
-+  const maxRetries = Number(process.env.DAEMON_DETECT_RETRIES || 2);
+   const child = spawn(def.bin, argv, spawnOptions);
++  trackChild(child);
++  emitTelemetry('run.started', { id: def.id, argv });
 @@
--      try {
-+      try {
-         // spawn version probe
--        const child = spawn(def.bin, def.versionArgs || ['--version'], { stdio: ['ignore', 'pipe', 'pipe'] });
-+        let child: any = null;
-+        let attempt = 0;
-+        let stdout = '';
-+        for (; attempt < maxRetries; attempt++) {
-+          try {
-+            child = spawn(def.bin, def.versionArgs || ['--version'], { stdio: ['ignore', 'pipe', 'pipe'] });
-+            stdout = '';
-+            if (child.stdout) child.stdout.on('data', (b: Buffer) => (stdout += b.toString()));
-+            await withTimeout(new Promise((r) => child.once('close', r)), timeouts.versionProbeTimeoutMs, () => { try { child.kill(); } catch {} });
-+            // success if we reached here
-+            break;
-+          } catch (e) {
-+            logger.warn('version probe failed, retrying', { id: def.id, attempt, err: e?.message || String(e) });
-+            if (attempt + 1 >= maxRetries) throw e;
-+            // small backoff
-+            await new Promise((r) => setTimeout(r, 100 * (attempt + 1)));
-+          }
-+        }
--        let stdout = '';
--        if (child.stdout) {
--          child.stdout.on('data', (b) => (stdout += b.toString()));
--        }
+   if (parser) {
+     parser(child, onEvent).catch((err) => {
+       onEvent({ type: 'error', error: err?.message || String(err) });
+     }).finally(() => {
+-      if (execTimer) clearTimeout(execTimer);
+-      if (startupTimer) clearTimeout(startupTimer);
+-      if (idleTimer) clearTimeout(idleTimer);
++      if (execTimer) clearTimeout(execTimer);
++      if (startupTimer) clearTimeout(startupTimer);
++      if (idleTimer) clearTimeout(idleTimer);
++      untrackChild(child);
++      emitTelemetry('run.finished', { id: def.id });
+     });
+   } else {
+@@
+     child.on('exit', (code, signal) => onEvent({ type: 'exit', code, signal }));
 -
--        // wait for close with timeout
--        await withTimeout(new Promise((resolve) => child.once('close', resolve)), timeouts.versionProbeTimeoutMs, () => {
--          try { child.kill(); } catch {};
--        });
-+        // stdout captured above
-@@
--        // Concurrently run authProbe and listModels when declared
-+        logger.info('detected agent', { id: def.id, path: def.bin, version: res.version });
-+        emitTelemetry('agent.detected', { id: def.id, path: def.bin, version: res.version });
-+
-+        // Concurrently run authProbe and listModels when declared
++    child.on('exit', (code, signal) => {
++      try { untrackChild(child); } catch (e) {}
++      emitTelemetry('run.exit', { id: def.id, code, signal });
++    });
 *** End Patch
