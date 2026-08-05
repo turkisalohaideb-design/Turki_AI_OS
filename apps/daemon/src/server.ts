@@ -27,10 +27,18 @@ export async function detectAgents(): Promise<AgentDetectionResult[]> {
     } else {
       // Try to spawn version probe if provided
       if (def.versionArgs && def.versionArgs.length > 0) {
+        // honor version probe timeout from env
+        const timeoutMs = Number(process.env.DAEMON_VERSION_PROBE_TIMEOUT_MS || 2000);
         try {
           const child = spawn(def.bin, def.versionArgs, { stdio: 'ignore' });
+          let timedOut = false;
+          const t = setTimeout(() => {
+            timedOut = true;
+            try { child.kill(); } catch (e) {}
+          }, timeoutMs);
           await new Promise<void>((resolve) => child.once('exit', () => resolve()));
-          r.available = true;
+          clearTimeout(t);
+          if (!timedOut) r.available = true; else { r.available = false; r.diagnostics!.push('version probe timeout'); }
         } catch (err: any) {
           r.available = false;
           r.diagnostics!.push(String(err));
@@ -90,7 +98,7 @@ export async function detectAgents(): Promise<AgentDetectionResult[]> {
           child.stdout?.on('data', (c) => out.push(Buffer.from(c)));
           await new Promise<void>((resolve) => child.once('exit', () => resolve()));
           const txt = Buffer.concat(out).toString().trim();
-          r.auth = txt || 'unknown';
+          r.auth = (txt || 'unknown').toLowerCase();
         } catch (e) {
           r.auth = 'unknown';
         }
@@ -127,6 +135,39 @@ export async function runAgent(opts: RunAgentOptions): Promise<any> {
 
   // telemetry: started
   try { emitTelemetry('run.started', { id: def.id, argv }); } catch (e) {}
+
+  // Track startup/idle timeouts (best-effort via env)
+  const startupTimeoutMs = Number(process.env.DAEMON_PROCESS_STARTUP_TIMEOUT_MS || 0);
+  const parserIdleTimeoutMs = Number(process.env.DAEMON_PARSER_IDLE_TIMEOUT_MS || 0);
+  let startupTimer: NodeJS.Timeout | null = null;
+  let idleTimer: NodeJS.Timeout | null = null;
+  let sawFirstData = false;
+  if (startupTimeoutMs > 0) {
+    startupTimer = setTimeout(() => {
+      opts.onEvent({ type: 'timeout', reason: 'startup' });
+      try { child.kill(); } catch (e) {}
+    }, startupTimeoutMs);
+  }
+
+  // helper to (re)arm idle timer
+  const armIdle = () => {
+    if (idleTimer) clearTimeout(idleTimer);
+    if (parserIdleTimeoutMs > 0) {
+      idleTimer = setTimeout(() => {
+        opts.onEvent({ type: 'timeout', reason: 'idle' });
+        try { child.kill(); } catch (e) {}
+      }, parserIdleTimeoutMs);
+    }
+  };
+
+  // observe raw stdout for timers (parsers also attach handlers)
+  child.stdout?.on('data', () => {
+    if (!sawFirstData) {
+      sawFirstData = true;
+      if (startupTimer) { clearTimeout(startupTimer); startupTimer = null; }
+    }
+    armIdle();
+  });
 
   // write prompt if def prefers stdin
   if (def.promptViaStdin && child.stdin) {

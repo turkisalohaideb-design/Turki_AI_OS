@@ -3,8 +3,8 @@ const { attachPlainStreamParser } = require('../../apps/daemon/src/runtimes/plai
 const { PassThrough } = require('stream');
 
 function makeChild(stdoutText) {
-  const fakeChild: any = { stdout: new PassThrough() };
-  const onceHandlers: Record<string, Function> = {};
+  const fakeChild = { stdout: new PassThrough() };
+  const onceHandlers = {};
   fakeChild.once = (ev, cb) => { onceHandlers[ev] = cb; };
   fakeChild.emit = (ev) => { if (onceHandlers[ev]) { try { onceHandlers[ev](); } catch (e) {} } };
   setImmediate(() => {
