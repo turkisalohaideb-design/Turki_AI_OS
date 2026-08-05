@@ -1,11 +1,9 @@
 import { turkiAgentDef } from './defs/turki-ai-os';
-import { exampleAgentDef } from './defs/example-cli';
 import { RuntimeAgentDef } from './types';
 
 const BASE_AGENT_DEFS: RuntimeAgentDef[] = [
-  // Order is not meaningful; ensure id uniqueness below
+  // Only register the Turki AI OS adapter here; additional adapters can be added to this array.
   turkiAgentDef,
-  exampleAgentDef,
 ];
 
 // Boot-time guard for duplicate ids

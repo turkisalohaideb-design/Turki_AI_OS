@@ -4,11 +4,12 @@ const { PassThrough } = require('stream');
 
 function makeChild(stdoutText) {
   const fakeChild = { stdout: new PassThrough() };
+  // ensure 'once' and 'emit' exist synchronously for the parser which awaits child.once('close')
+  fakeChild.emit = (ev) => {};
+  fakeChild.once = (ev, cb) => cb();
   setImmediate(() => {
     fakeChild.stdout.write(stdoutText);
     fakeChild.stdout.end();
-    fakeChild.emit = (ev) => {};
-    fakeChild.once = (ev, cb) => cb();
   });
   return fakeChild;
 }

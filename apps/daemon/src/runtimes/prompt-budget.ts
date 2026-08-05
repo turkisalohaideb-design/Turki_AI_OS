@@ -31,34 +31,35 @@ export function checkPromptArgvBudget(promptBytes: number, maxPromptArgBytes = D
 
 // When the resolved binary is a cmd.exe shim (.cmd/.bat), the runtime composes an inner command line
 // of the form: cmd.exe /d /s /c "<inner>" where <inner> contains the command + args. The shim path and
-// argument quoting can expand the size. This helper estimates the worst-case expansion by doubling
-// embedded quotes in the inner command and computing the total length.
+// argument quoting can expand the size. This helper estimates a conservative worst-case expansion.
 export function checkWindowsCmdShimCommandLineBudget(innerCommand: string, maxTotal = CREATE_PROCESS_CMDLINE_LIMIT) {
   // Simulate Windows cmd quoting expansion: inner quotes are doubled when wrapped
   const expandedInner = innerCommand.replace(/"/g, '""');
   const wrapper = 'cmd.exe /d /s /c "' + expandedInner + '"';
-  if (wrapper.length > maxTotal) {
+  // Conservative guard: treat anything very close to the limit as unsafe (95% threshold)
+  const worstCase = wrapper.length;
+  if (worstCase > Math.floor(maxTotal * 0.95)) {
     throw new PromptBudgetError(
       'AGENT_PROMPT_TOO_LARGE',
-      `Command line length ${wrapper.length} would exceed CreateProcess limit ${maxTotal} when using cmd shim. Reduce prompt or use stdin-capable adapter.`,
+      `Command line length ${worstCase} would be unsafe for CreateProcess limit ${maxTotal} when using cmd shim. Reduce prompt or use stdin-capable adapter.`,
     );
   }
   return true;
 }
 
 // When the resolved binary is a direct .exe, libuv-style escaping may be applied where backslashes
-// preceding quotes are doubled. This function approximates quoting expansion by replacing each quote
-// with \" and doubling backslashes before quotes. This is conservative but safe.
+// preceding quotes are doubled. This function approximates quoting expansion conservatively.
 export function checkWindowsDirectExeCommandLineBudget(commandLine: string, maxTotal = CREATE_PROCESS_CMDLINE_LIMIT) {
   // Conservative expansion: replace " with \" and double backslashes before quotes
   const expanded = commandLine.replace(/(\\*)"/g, (match, backslashes) => {
     // double backslashes, then escape the quote
     return backslashes + backslashes + '\\"';
   });
-  if (expanded.length > maxTotal) {
+  const worstCase = expanded.length;
+  if (worstCase > Math.floor(maxTotal * 0.95)) {
     throw new PromptBudgetError(
       'AGENT_PROMPT_TOO_LARGE',
-      `Command line length ${expanded.length} would exceed CreateProcess limit ${maxTotal} for direct .exe quoting. Reduce prompt or use stdin-capable adapter.`,
+      `Command line length ${worstCase} would be unsafe for CreateProcess limit ${maxTotal} for direct .exe quoting. Reduce prompt or use stdin-capable adapter.`,
     );
   }
   return true;
