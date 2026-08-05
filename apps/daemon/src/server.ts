@@ -21,40 +21,38 @@ export async function detectAgents(): Promise<AgentDetectionResult[]> {
   for (const def of AGENT_DEFS) {
     const r: AgentDetectionResult = { id: def.id, name: def.name, available: false, diagnostics: [] };
 
-    // Basic availability: if bin is the running node executable (tests set this), treat as available
-    if (def.bin === process.execPath) {
+    // Probe sequence: prefer explicit versionArgs probe (honoring timeouts),
+    // otherwise fall back to marking node binary as available or trying --version.
+    if (def.versionArgs && def.versionArgs.length > 0) {
+      const timeoutMs = Number(process.env.DAEMON_VERSION_PROBE_TIMEOUT_MS || 2000);
+      try {
+        const child = spawn(def.bin, def.versionArgs, { stdio: 'ignore' });
+        const exitPromise = new Promise<void>((resolve) => child.once('exit', () => resolve()));
+        const timeoutPromise = new Promise<void>((resolve) => setTimeout(resolve, timeoutMs));
+        const first = await Promise.race([exitPromise.then(() => 'exit'), timeoutPromise.then(() => 'timeout')]);
+        if (first === 'exit') {
+          r.available = true;
+        } else {
+          try { child.kill(); } catch (e) {}
+          r.available = false;
+          r.diagnostics!.push('version probe timeout');
+        }
+      } catch (err: any) {
+        r.available = false;
+        r.diagnostics!.push(String(err));
+      }
+    } else if (def.bin === process.execPath) {
+      // Common test convenience: node executable means the test harness will run scripts; treat as available
       r.available = true;
     } else {
-      // Try to spawn version probe if provided
-      if (def.versionArgs && def.versionArgs.length > 0) {
-        // honor version probe timeout from env
-        const timeoutMs = Number(process.env.DAEMON_VERSION_PROBE_TIMEOUT_MS || 2000);
-        try {
-          const child = spawn(def.bin, def.versionArgs, { stdio: 'ignore' });
-          const exitPromise = new Promise<void>((resolve) => child.once('exit', () => resolve()));
-          const timeoutPromise = new Promise<void>((resolve) => setTimeout(resolve, timeoutMs));
-          const first = await Promise.race([exitPromise.then(() => 'exit'), timeoutPromise.then(() => 'timeout')]);
-          if (first === 'exit') {
-            r.available = true;
-          } else {
-            try { child.kill(); } catch (e) {}
-            r.available = false;
-            r.diagnostics!.push('version probe timeout');
-          }
-        } catch (err: any) {
-          r.available = false;
-          r.diagnostics!.push(String(err));
-        }
-      } else {
-        // Fallback: mark available if bin exists in PATH by trying to spawn with --version
-        try {
-          const child = spawn(def.bin, ['--version'], { stdio: 'ignore' });
-          await new Promise<void>((resolve) => child.once('exit', () => resolve()));
-          r.available = true;
-        } catch (err: any) {
-          r.available = false;
-          r.diagnostics!.push(String(err));
-        }
+      // Fallback: mark available if bin exists in PATH by trying to spawn with --version
+      try {
+        const child = spawn(def.bin, ['--version'], { stdio: 'ignore' });
+        await new Promise<void>((resolve) => child.once('exit', () => resolve()));
+        r.available = true;
+      } catch (err: any) {
+        r.available = false;
+        r.diagnostics!.push(String(err));
       }
     }
 
