@@ -1,3 +1,5 @@
+"use client"
+
 import React from 'react';
 import Sidebar from '../components/dashboard/Sidebar';
 import Header from '../components/dashboard/Header';
@@ -6,16 +8,9 @@ import ModelCard from '../components/dashboard/ModelCard';
 import AgentCard from '../components/dashboard/AgentCard';
 import ProjectCard from '../components/dashboard/ProjectCard';
 import QuickActions from '../components/dashboard/QuickActions';
-import { MODELS, AGENTS, PROJECTS, ACTIVITY } from '../components/dashboard/constants';
+import RecentActivity from '../components/dashboard/RecentActivity';
 
 export default function DashboardPage() {
-  const stats = [
-    { label: 'CPU Usage', value: '42%', percent: 42 },
-    { label: 'RAM Usage', value: '61%', percent: 61 },
-    { label: 'GPU Usage', value: '27%', percent: 27 },
-    { label: 'Disk Usage', value: '52%', percent: 52 },
-  ];
-
   return (
     <div className="min-h-screen bg-zinc-950 text-white">
       <Sidebar />
@@ -25,29 +20,16 @@ export default function DashboardPage() {
         <main className="p-6 grid grid-cols-1 lg:grid-cols-3 gap-6">
           <div className="lg:col-span-2 space-y-6">
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-              <StatsCard stats={stats} />
-              <ModelCard models={MODELS} />
+              <StatsCard />
+              <ModelCard />
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-              <AgentCard agents={AGENTS} />
-              <ProjectCard projects={PROJECTS} />
+              <AgentCard />
+              <ProjectCard />
             </div>
 
-            <div className="p-4 bg-zinc-900 rounded-2xl border border-zinc-800 max-h-72 overflow-auto">
-              <h3 className="text-lg font-semibold text-white mb-3">Recent Activity</h3>
-              <div className="space-y-3 text-sm text-zinc-300">
-                {ACTIVITY.map((a) => (
-                  <div key={a.id} className="flex items-start gap-3">
-                    <div className="w-2 h-2 mt-2 rounded-full bg-zinc-500" />
-                    <div>
-                      <div className="text-xs text-zinc-400">{a.time}</div>
-                      <div className="text-sm text-white">{a.text}</div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
+            <RecentActivity />
           </div>
 
           <aside className="space-y-6">
